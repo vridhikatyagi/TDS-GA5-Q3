@@ -14,6 +14,7 @@ import os
 import posixpath
 import re
 import shlex
+import unicodedata
 from urllib.parse import urlsplit
 
 from flask import Flask, request, jsonify
@@ -37,7 +38,13 @@ def normalize_path(raw_path: str, cwd: str = AGENT_CWD, home: str = AGENT_HOME) 
     to an absolute, collapsed path, WITHOUT touching the real filesystem
     (the target files/dirs may not exist on this host).
     """
-    p = raw_path.strip()
+    # Normalize Unicode compatibility forms FIRST. This defeats homoglyph/
+    # fullwidth tricks (e.g. fullwidth solidus "／" U+FF0F -> "/", fullwidth
+    # full stop "．" U+FF0E -> ".") that could otherwise slip a real ".." or
+    # "/" past our checks as literal non-special characters, while a
+    # downstream Unicode-normalizing filesystem layer would treat them as
+    # genuine path separators/traversal and actually escape the sandbox.
+    p = unicodedata.normalize("NFKC", raw_path).strip()
 
     # Strip matching surrounding quotes a shell would strip.
     if len(p) >= 2 and p[0] == p[-1] and p[0] in ("'", '"'):
