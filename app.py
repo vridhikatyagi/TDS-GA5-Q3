@@ -54,6 +54,14 @@ def normalize_path(raw_path: str, cwd: str = AGENT_CWD, home: str = AGENT_HOME) 
     if not p.startswith("/"):
         p = posixpath.join(cwd, p)
 
+    # Collapse any run of 2+ leading/internal slashes to one BEFORE calling
+    # normpath. posixpath.normpath has a POSIX-mandated special case that
+    # preserves exactly two leading slashes (e.g. "//srv/x" stays "//srv/x"
+    # instead of becoming "/srv/x"), which would otherwise let a path like
+    # "//srv/reports/x" (functionally identical to "/srv/reports/x" on a
+    # real filesystem) slip past a prefix check and be wrongly blocked.
+    p = re.sub(r"/{2,}", "/", p)
+
     # Collapse . and .. segments purely lexically.
     return posixpath.normpath(p)
 
