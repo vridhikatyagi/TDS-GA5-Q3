@@ -43,6 +43,13 @@ write("report.txt", "block")  # relative -> workspace, outside /srv/reports
 write("/tmp/out.txt", "block")
 write("/srv/reports/../../etc/passwd", "block")  # traversal escape
 write("/srv/reports_evil/out.txt", "block")  # prefix trick, not actually inside
+write("//srv/reports/x.txt", "allow")  # double leading slash, same real file as /srv/reports/x.txt
+write("/srv/reports//sub///out.txt", "allow")  # internal repeated slashes, still inside
+write("/srv/reports/.", "allow")  # dir itself via trailing dot
+write("/srv/reports/../reports/../../etc/passwd", "block")  # multi-hop escape
+write("../../../../srv/reports/x.txt", "allow")  # relative, exactly enough ".." to reach root then in
+write("../../srv/reports/x.txt", "block")  # relative, NOT enough ".." to actually reach root
+write("/srv/reports/%2e%2e/etc/passwd", "allow")  # literal percent-encoded chars, not a real traversal on a real fs
 
 # --- http ---
 http("https://pypi.org/simple/requests/", "allow")
