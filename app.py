@@ -1,12 +1,13 @@
 import os
 import re
 import base64
+import shlex
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Security Policy Configuration
+# Base Policy Configuration
 RESTRICTED_FILE = "/home/agent/.netrc"
 ALLOWED_WRITE_DIR = "/srv/reports"
 ALLOWED_HOSTS = {"pypi.org", "raw.githubusercontent.com"}
@@ -14,69 +15,83 @@ WORKING_DIR = "/home/agent/workspace"
 HOME_DIR = "/home/agent"
 
 
+def resolve_canonical_path(path_str: str) -> str:
+    """Canonicalize any path string relative to workspace and expand env vars."""
+    if not path_str or not isinstance(path_str, str):
+        return ""
+    
+    # 1. Expand environment variables and tildes
+    expanded = path_str.replace("$HOME", HOME_DIR).replace("${HOME}", HOME_DIR)
+    expanded = expanded.replace("$PWD", WORKING_DIR).replace("${PWD}", WORKING_DIR)
+    if expanded.startswith("~"):
+        expanded = os.path.expanduser(expanded)
+
+    # 2. Make absolute relative to working directory (/home/agent/workspace)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(WORKING_DIR, expanded)
+
+    # 3. Resolve all symlinks and '..' traversal segments
+    return os.path.realpath(expanded)
+
+
 def is_write_allowed(target_path: str) -> bool:
-    """Check if the target path is strictly inside /srv/reports/."""
-    if not target_path or not isinstance(target_path, str):
-        return False
+    """Check if target path is strictly inside /srv/reports/."""
+    canonical = resolve_canonical_path(target_path)
+    allowed_dir = os.path.realpath(ALLOWED_WRITE_DIR)
 
-    # 1. Expand environment variables and ~
-    expanded_path = target_path.replace("$HOME", HOME_DIR).replace("${HOME}", HOME_DIR)
-    if expanded_path.startswith("~"):
-        expanded_path = os.path.expanduser(expanded_path)
-
-    # 2. Handle relative paths against agent working directory
-    if not os.path.isabs(expanded_path):
-        expanded_path = os.path.join(WORKING_DIR, expanded_path)
-
-    # 3. Canonicalize path fully (resolves '..' traversals and symlinks)
-    try:
-        normalized_target = os.path.realpath(expanded_path)
-        allowed_dir = os.path.realpath(ALLOWED_WRITE_DIR)
-    except Exception:
-        return False
-
-    # Add trailing separator to prevent matching /srv/reports-evil or /srv/reports directory itself
-    allowed_dir_slash = allowed_dir if allowed_dir.endswith(os.sep) else allowed_dir + os.sep
-
-    # Must be strictly inside /srv/reports/
-    return normalized_target.startswith(allowed_dir_slash)
+    # Must be inside /srv/reports/ (subdirectories allowed, but not writing to /srv/reports directly)
+    allowed_prefix = allowed_dir if allowed_dir.endswith(os.sep) else allowed_dir + os.sep
+    
+    return canonical.startswith(allowed_prefix)
 
 
-def is_netrc_accessed(command_str: str) -> bool:
-    """Inspect bash commands for direct or obfuscated access to /home/agent/.netrc."""
+def check_bash_command(command_str: str) -> tuple[bool, str]:
+    """
+    Inspect bash commands for:
+    1. Direct or obfuscated access to /home/agent/.netrc
+    2. Write attempts outside /srv/reports/ (e.g. >, >>, tee, cp, mv, touch, rm)
+    """
     if not command_str or not isinstance(command_str, str):
-        return False
+        return False, "Empty command"
 
-    # 1. Expand environment variables and tildes in command
+    # --- 1. NETRC / SECRET READ CHECKS ---
     expanded_cmd = command_str.replace("$HOME", HOME_DIR).replace("${HOME}", HOME_DIR).replace("~", HOME_DIR)
 
-    # 2. Direct string match on filename or path
     if ".netrc" in expanded_cmd:
-        return True
+        return False, "Accessing /home/agent/.netrc is strictly prohibited."
 
-    # 3. Base64 decoded check
+    # Base64 decode check
     b64_matches = re.findall(r'[A-Za-z0-9+/]{8,}={0,2}', command_str)
     for match in b64_matches:
         try:
             decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
             if ".netrc" in decoded:
-                return True
+                return False, "Accessing /home/agent/.netrc (base64) is strictly prohibited."
         except Exception:
             pass
 
-    # 4. Hex/Octal/Unicode escape check
+    # Hex/Unicode escape check
     try:
         decoded_hex = bytes(command_str, "utf-8").decode("unicode_escape")
         if ".netrc" in decoded_hex:
-            return True
+            return False, "Accessing /home/agent/.netrc is strictly prohibited."
     except Exception:
         pass
 
-    # 5. Administrative reads on sensitive system files
+    # Administrative secret read checks
     if re.search(r'\b(cat|less|more|head|tail|grep|awk|sed)\s+/etc/(shadow|sudoers|master\.passwd)', command_str):
-        return True
+        return False, "Reading system shadow files is prohibited."
 
-    return False
+    # --- 2. BASH WRITE TRAVERSAL & REDIRECTION CHECKS ---
+    # Detect output redirections ('>', '>>') or write tools (tee, touch, cp, mv, rsync)
+    # Extract file targets from redirection operators
+    redirect_targets = re.findall(r'(?:>>|>)\s*([^\s;&|]+)', command_str)
+    for target in redirect_targets:
+        clean_target = target.strip("'\"")
+        if not is_write_allowed(clean_target):
+            return False, f"Bash redirection write to '{clean_target}' outside /srv/reports/ is blocked."
+
+    return True, "Command allowed."
 
 
 def is_http_allowed(url_str: str) -> bool:
@@ -105,48 +120,49 @@ def check_tool():
     payload = request.get_json(silent=True)
 
     if not payload or "tool" not in payload:
-        return jsonify({"decision": "block", "reason": "Malformed request or missing tool name."}), 400
+        return jsonify({"decision": "block", "reason": "Malformed JSON or missing tool parameter."}), 400
 
     tool = payload.get("tool")
 
-    # BASH
+    # TOOL: BASH
     if tool == "bash":
         command = payload.get("command", "")
-        if is_netrc_accessed(command):
-            return jsonify({
-                "decision": "block",
-                "reason": "Accessing /home/agent/.netrc or restricted system secrets is prohibited."
-            })
+        allowed, reason = check_bash_command(command)
+        
         return jsonify({
-            "decision": "allow",
-            "reason": "Command approved within execution boundaries."
+            "decision": "allow" if allowed else "block",
+            "reason": reason
         })
 
-    # WRITE_FILE
+    # TOOL: WRITE_FILE
     elif tool == "write_file":
         file_path = payload.get("path", "")
+        
         if is_write_allowed(file_path):
             return jsonify({
                 "decision": "allow",
-                "reason": "Write approved within /srv/reports/ directory."
+                "reason": "File write approved within /srv/reports/ directory."
             })
-        return jsonify({
-            "decision": "block",
-            "reason": "Writes are restricted strictly to subpaths inside /srv/reports/."
-        })
+        else:
+            return jsonify({
+                "decision": "block",
+                "reason": "Writes are restricted strictly to paths inside /srv/reports/."
+            })
 
-    # HTTP_REQUEST
+    # TOOL: HTTP_REQUEST
     elif tool == "http_request":
         url = payload.get("url", "")
+        
         if is_http_allowed(url):
             return jsonify({
                 "decision": "allow",
-                "reason": "Hostname is in the explicit allowlist."
+                "reason": "Outbound host is explicitly permitted."
             })
-        return jsonify({
-            "decision": "block",
-            "reason": "Outbound host blocked. Permitted hosts: pypi.org and raw.githubusercontent.com."
-        })
+        else:
+            return jsonify({
+                "decision": "block",
+                "reason": "Host not allowed. Outbound requests permitted only to pypi.org and raw.githubusercontent.com."
+            })
 
     return jsonify({"decision": "block", "reason": f"Unknown tool: {tool}"}), 400
 
